@@ -4,15 +4,12 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.media.MediaPlayer
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
@@ -26,9 +23,10 @@ class MediaPlayerService : android.app.Service() {
     private val binder = MediaPlayerBinder()
     private var currentMediaItem: MediaItem? = null
     private var isPlaying = false
-    private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var mediaSession: MediaSessionCompat
     private lateinit var notificationManager: NotificationManager
+    private var playlist: List<MediaItem> = emptyList()
+    private var currentTrackIndex: Int = -1
 
     // Public getters
     fun getCurrentMediaItem(): MediaItem? = currentMediaItem
@@ -51,7 +49,6 @@ class MediaPlayerService : android.app.Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        acquireWakeLock()
         setupMediaSession()
     }
 
@@ -107,31 +104,105 @@ class MediaPlayerService : android.app.Service() {
         }
     }
 
-    private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "MediaPlayerService::WakeLock"
-        ).apply {
-            acquire(10*60*1000L) // 10 minutes
-        }
-    }
-
     override fun onBind(intent: Intent?): IBinder {
         return binder
     }
 
-    fun playMedia(mediaItem: MediaItem) {
-        currentMediaItem = mediaItem
-        mediaPlayer?.release()
-        mediaPlayer = MediaPlayer().apply {
-            setDataSource(mediaItem.path)
-            prepare()
-            start()
+    fun setPlaylist(items: List<MediaItem>) {
+        playlist = items
+        currentTrackIndex = if (currentMediaItem != null) {
+            items.indexOfFirst { it.path == currentMediaItem?.path }
+        } else {
+            -1
         }
-        isPlaying = true
-        updateNotification()
-        updateMediaSession()
+    }
+
+    private fun playNext() {
+        if (playlist.isEmpty()) return
+        
+        val nextIndex = if (currentTrackIndex < playlist.size - 1) {
+            currentTrackIndex + 1
+        } else {
+            0 // Зацикливание
+        }
+        
+        playTrackAtIndex(nextIndex)
+    }
+
+    private fun playPrevious() {
+        if (playlist.isEmpty()) return
+        
+        val prevIndex = if (currentTrackIndex > 0) {
+            currentTrackIndex - 1
+        } else {
+            playlist.size - 1 // Зацикливание
+        }
+        
+        playTrackAtIndex(prevIndex)
+    }
+
+    private fun playTrackAtIndex(index: Int) {
+        if (index in playlist.indices) {
+            currentTrackIndex = index
+            playMedia(playlist[index])
+        }
+    }
+
+    private fun setOnErrorListener(mediaPlayer: MediaPlayer) {
+        mediaPlayer.setOnErrorListener { mp, what, extra ->
+            when (what) {
+                MediaPlayer.MEDIA_ERROR_SERVER_DIED -> {
+                    mp.release()
+                    val item = currentMediaItem
+                    if (item != null) {
+                        playMedia(item)
+                    }
+                    true
+                }
+                MediaPlayer.MEDIA_ERROR_MALFORMED -> {
+                    isPlaying = false
+                    updateNotification()
+                    updateMediaSession()
+                    playNext()
+                    true
+                }
+                else -> {
+                    isPlaying = false
+                    updateNotification()
+                    updateMediaSession()
+                    true
+                }
+            }
+        }
+    }
+
+    fun playMedia(mediaItem: MediaItem) {
+        try {
+            currentMediaItem = mediaItem
+            mediaPlayer?.release()
+            
+            val player = MediaPlayer()
+            player.setDataSource(mediaItem.path)
+            player.setOnCompletionListener {
+                isPlaying = false
+                updateNotification()
+                updateMediaSession()
+                playNext() // Автоматически переключаем на следующий трек
+            }
+            setOnErrorListener(player)
+            player.prepare()
+            player.start()
+            mediaPlayer = player
+            
+            isPlaying = true
+            updateNotification()
+            updateMediaSession()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            isPlaying = false
+            updateNotification()
+            updateMediaSession()
+        }
     }
 
     fun togglePlayPause() {
@@ -160,14 +231,6 @@ class MediaPlayerService : android.app.Service() {
         return mediaPlayer?.duration ?: 0
     }
 
-    private fun playNext() {
-        // TODO: Implement next track
-    }
-
-    private fun playPrevious() {
-        // TODO: Implement previous track
-    }
-
     private fun updateNotification() {
         val notification = createNotification()
         startForeground(NOTIFICATION_ID, notification)
@@ -177,7 +240,7 @@ class MediaPlayerService : android.app.Service() {
         val currentItem = currentMediaItem ?: return createEmptyNotification()
 
         val contentIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val contentPendingIntent = PendingIntent.getActivity(
             this,
@@ -238,7 +301,7 @@ class MediaPlayerService : android.app.Service() {
 
     private fun createEmptyNotification(): Notification {
         val contentIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val contentPendingIntent = PendingIntent.getActivity(
             this,
@@ -258,39 +321,50 @@ class MediaPlayerService : android.app.Service() {
     }
 
     private fun updateMediaSession() {
+        if (!::mediaSession.isInitialized) return
+        
         val currentItem = currentMediaItem ?: return
 
-        val metadata = MediaMetadataCompat.Builder()
-            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, currentItem.title)
-            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentItem.artist)
-            .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, currentItem.duration)
-            .build()
+        try {
+            val metadata = MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, currentItem.title)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentItem.artist)
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, currentItem.duration)
+                .build()
 
-        val state = if (isPlaying) {
-            PlaybackStateCompat.STATE_PLAYING
-        } else {
-            PlaybackStateCompat.STATE_PAUSED
+            val state = if (isPlaying) {
+                PlaybackStateCompat.STATE_PLAYING
+            } else {
+                PlaybackStateCompat.STATE_PAUSED
+            }
+
+            val stateBuilder = PlaybackStateCompat.Builder()
+                .setActions(
+                    PlaybackStateCompat.ACTION_PLAY or
+                    PlaybackStateCompat.ACTION_PAUSE or
+                    PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                    PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                    PlaybackStateCompat.ACTION_STOP
+                )
+                .setState(state, getCurrentPosition().toLong(), 1f)
+
+            mediaSession.setMetadata(metadata)
+            mediaSession.setPlaybackState(stateBuilder.build())
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-
-        val stateBuilder = PlaybackStateCompat.Builder()
-            .setActions(
-                PlaybackStateCompat.ACTION_PLAY or
-                PlaybackStateCompat.ACTION_PAUSE or
-                PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
-                PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
-                PlaybackStateCompat.ACTION_STOP
-            )
-            .setState(state, getCurrentPosition().toLong(), 1f)
-
-        mediaSession.setMetadata(metadata)
-        mediaSession.setPlaybackState(stateBuilder.build())
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        wakeLock?.release()
-        mediaPlayer?.release()
-        mediaPlayer = null
-        mediaSession.release()
+        try {
+            mediaPlayer?.release()
+            mediaPlayer = null
+            if (::mediaSession.isInitialized) {
+                mediaSession.release()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 } 
